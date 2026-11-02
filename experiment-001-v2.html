@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#020203">
+<title>Experiment 001</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#020203}body{position:fixed;inset:0;overscroll-behavior:none;touch-action:none}canvas{display:block;width:100%;height:100%;outline:none}
+#enter{position:fixed;z-index:5;right:16px;bottom:16px;width:42px;height:42px;border:1px solid #ffffff35;border-radius:50%;background:#10101455;color:#ffffffb0;display:grid;place-items:center;padding:0;cursor:pointer;backdrop-filter:blur(8px);-webkit-tap-highlight-color:transparent}#enter svg{width:19px;height:19px}#enter[hidden]{display:none}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"}}</script>
+</head>
+<body>
+<button id="enter" aria-label="Enter immersive view"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+<script type="module">
+import * as THREE from 'three';
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x020203);scene.fog=new THREE.FogExp2(0x020203,.018);
+const camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,.03,100);camera.position.set(0,1.62,0);camera.rotation.order='YXZ';
+const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(innerWidth,innerHeight);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.12;renderer.xr.enabled=true;document.body.appendChild(renderer.domElement);
+scene.add(new THREE.HemisphereLight(0x17202b,0x030305,.45));
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(200,200),new THREE.MeshStandardMaterial({color:0x050507,roughness:.98}));floor.rotation.x=-Math.PI/2;floor.position.y=-.015;scene.add(floor);
+const geo=new THREE.BoxGeometry(1.2,1.2,1.2,10,10,10),base=geo.attributes.position.array.slice();
+const mat=new THREE.MeshStandardMaterial({color:0xb8bec8,roughness:.58,metalness:.08});
+const cube=new THREE.Mesh(geo,mat);cube.position.set(0,.6,-2);scene.add(cube);
+const lights=[
+ {light:new THREE.PointLight(0xff284f,20,8,1.65),color:new THREE.Color(0xff284f),phase:.2,r:1.05,y:1.1},
+ {light:new THREE.PointLight(0x416cff,22,8,1.65),color:new THREE.Color(0x416cff),phase:2.25,r:1.25,y:.75},
+ {light:new THREE.PointLight(0x43f0dc,17,7,1.65),color:new THREE.Color(0x43f0dc),phase:4.3,r:.9,y:1.55}
+];
+for(const o of lights){scene.add(o.light);o.core=new THREE.Mesh(new THREE.SphereGeometry(.025,12,8),new THREE.MeshBasicMaterial({color:o.color}));scene.add(o.core)}
+const enter=document.querySelector('#enter'),clock=new THREE.Clock();let gyro=false,drag=false,lx=0,ly=0,yaw=0,pitch=0,keys=new Set(),sensorOffset=null;
+function orient(e){if(!gyro||e.alpha==null||e.beta==null||e.gamma==null)return;const d=Math.PI/180,screen=(screen.orientation?.angle||0)*d;const q=new THREE.Quaternion().setFromEuler(new THREE.Euler(e.beta*d,e.alpha*d,-e.gamma*d,'YXZ'));q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1),-screen));if(!sensorOffset)sensorOffset=q.clone().invert();camera.quaternion.copy(sensorOffset).multiply(q)}
+async function enterView(){try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen?.().catch(()=>{});if(typeof DeviceOrientationEvent!=='undefined'){if(typeof DeviceOrientationEvent.requestPermission==='function')gyro=(await DeviceOrientationEvent.requestPermission())==='granted';else gyro=true;if(gyro)window.addEventListener('deviceorientation',orient,true)}if(navigator.xr&&await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)){const s=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']});await renderer.xr.setSession(s);enter.hidden=true;s.addEventListener('end',()=>enter.hidden=false)}enter.style.opacity='.2'}catch{}}
+enter.addEventListener('click',enterView);
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'){drag=true;lx=e.clientX;ly=e.clientY;renderer.domElement.setPointerCapture(e.pointerId)}});
+renderer.domElement.addEventListener('pointermove',e=>{if(!drag||e.pointerType!=='mouse'||gyro||renderer.xr.isPresenting)return;yaw-=(e.clientX-lx)*.003;pitch=THREE.MathUtils.clamp(pitch-(e.clientY-ly)*.003,-1.45,1.45);camera.rotation.set(pitch,yaw,0,'YXZ');lx=e.clientX;ly=e.clientY});
+renderer.domElement.addEventListener('pointerup',()=>drag=false);renderer.domElement.addEventListener('pointercancel',()=>drag=false);
+window.addEventListener('keydown',e=>keys.add(e.code));window.addEventListener('keyup',e=>keys.delete(e.code));
+function animate(t,dt){lights.forEach((o,i)=>{const a=t*(.16+i*.025)+o.phase;o.light.position.set(Math.cos(a)*o.r,o.y+Math.sin(t*.28+o.phase)*.42,-2+Math.sin(a)*o.r);o.light.intensity=(i===1?22:i===0?19:16)*(.55+.45*(.5+.5*Math.sin(t*.42+o.phase)));o.core.position.copy(o.light.position);o.core.material.color.copy(o.color).multiplyScalar(.55+.45*Math.sin(t*.4+o.phase))});
+const p=geo.attributes.position.array,energy=.5+.22*Math.sin(t*.43)+.16*Math.sin(t*.27+1.6)+.12*Math.cos(t*.61);
+for(let i=0;i<geo.attributes.position.count;i++){const x=base[i*3],y=base[i*3+1],z=base[i*3+2],wave=Math.sin(x*3.1+t*.75)*Math.cos(y*2.8-t*.46)*Math.sin(z*3+t*.52),rad=Math.sin(t*.33+(x+y+z)*1.7),len=Math.max(.001,Math.hypot(x,y,z)),d=(wave*.045+rad*.018)*energy;p[i*3]=x+x/len*d;p[i*3+1]=y+y/len*d;p[i*3+2]=z+z/len*d}
+geo.attributes.position.needsUpdate=true;geo.computeVertexNormals();const c=new THREE.Color(.46,.48,.53);for(const o of lights)c.lerp(o.color,.06+.11*(.5+.5*Math.sin(t*.38+o.phase)));mat.color.copy(c);cube.scale.set(1+.025*Math.sin(t*.47),1+.035*Math.sin(t*.31+1.2),1+.025*Math.cos(t*.39));cube.rotation.y=.06*Math.sin(t*.17);
+if(!renderer.xr.isPresenting&&!gyro){const speed=1.35*dt,forward=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw)),right=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));if(keys.has('KeyW')||keys.has('ArrowUp'))camera.position.addScaledVector(forward,speed);if(keys.has('KeyS')||keys.has('ArrowDown'))camera.position.addScaledVector(forward,-speed);if(keys.has('KeyA')||keys.has('ArrowLeft'))camera.position.addScaledVector(right,-speed);if(keys.has('KeyD')||keys.has('ArrowRight'))camera.position.addScaledVector(right,speed);camera.position.y=1.62}
+renderer.render(scene,camera)}
+window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+renderer.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.05);animate(clock.elapsedTime,dt)});
+</script>
+</body></html>

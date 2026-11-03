@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#08060b">
+<title>Experiment — Jelly Torus v3</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#08060b}
+body{position:fixed;inset:0;overscroll-behavior:none;touch-action:none}
+canvas{display:block;width:100%;height:100%;outline:none}
+#enter{position:fixed;z-index:5;right:16px;bottom:16px;width:44px;height:44px;border:1px solid #fff3;border-radius:50%;background:#17101bb0;color:#fffD;display:grid;place-items:center;padding:0;cursor:pointer;backdrop-filter:blur(10px)}
+#enter svg{width:19px;height:19px}
+#hint{position:fixed;left:12px;bottom:12px;color:#ffffff60;font:11px system-ui,sans-serif;pointer-events:none;max-width:75vw}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+</head>
+<body>
+<button id="enter" aria-label="Войти в иммерсивный режим"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+<div id="hint"></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const hint=document.querySelector('#hint');
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x08060b);
+scene.fog=new THREE.FogExp2(0x100914,.027);
+const camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,.03,100);
+camera.position.set(0,1.62,0);camera.rotation.order='YXZ';
+
+const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));renderer.setSize(innerWidth,innerHeight);
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.22;
+renderer.xr.enabled=true;document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0x806d99,0x140b1b,.72));
+const floorMat=new THREE.MeshStandardMaterial({color:0x100b16,roughness:.34,metalness:.25});
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(200,200),floorMat);
+floor.rotation.x=-Math.PI/2;floor.position.y=0;scene.add(floor);
+
+// Coloured light is deliberately unusual: amethyst, acid pear, warm coral and glacial mint.
+function pointLight(color,intensity,pos,dist=8){
+ const l=new THREE.PointLight(color,intensity,dist,1.55);l.position.set(...pos);scene.add(l);return l;
+}
+const lights=[
+ pointLight(0xb78cff,22,[1.1,2.2,-1.7],8),
+ pointLight(0xd7f27a,18,[-1.6,1.4,-2.5],7),
+ pointLight(0xff8e73,12,[0,2.8,-3.3],8),
+ pointLight(0x83f0d4,10,[1.8,.55,-2.2],6)
+];
+
+// Subtle luminous haze pools; these are meshes, not screen-space UI.
+function glowDisc(color,opacity,scale,pos){
+ const m=new THREE.Mesh(new THREE.CircleGeometry(1,48),new THREE.MeshBasicMaterial({color,transparent:true,opacity,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide}));
+ m.rotation.x=-Math.PI/2;m.scale.set(scale,scale,1);m.position.set(...pos);scene.add(m);return m;
+}
+const floorGlow1=glowDisc(0x8d63b8,.12,1.45,[0,.012,-2]);
+const floorGlow2=glowDisc(0xc4eb78,.07,.8,[.2,.014,-2.2]);
+
+// Object is anchored in the room; its animation is independent from GLB animation.
+const anchor=new THREE.Group();anchor.position.set(0,.15,-2);scene.add(anchor);
+const modelRoot=new THREE.Group();anchor.add(modelRoot);
+let mesh=null,geom=null,basePositions=null,spherePositions=null;
+let morph=0,morphTarget=0,burst=false,particles=null,particleVelocities=[],burstAge=0;
+let gyroEnabled=false,tiltX=0,tiltZ=0,yaw=0,pitch=0,dragging=false,lastX=0,lastY=0;
+const keys=new Set();let lastShake=0;
+const clock=new THREE.Clock();
+const loader=new GLTFLoader();
+
+loader.load('./torus.glb',gltf=>{
+ const loaded=gltf.scene;modelRoot.add(loaded);loaded.updateMatrixWorld(true);
+ const box=new THREE.Box3().setFromObject(loaded),size=new THREE.Vector3();box.getSize(size);
+ const center=new THREE.Vector3();box.getCenter(center);
+ loaded.position.sub(center);
+ if(size.length()>0)loaded.scale.setScalar(.9/Math.max(size.x,size.y,size.z));
+ loaded.updateMatrixWorld(true);
+ loaded.traverse(o=>{
+  if(o.isMesh&&!mesh){
+   mesh=o;geom=o.geometry.clone();o.geometry=geom;
+   basePositions=geom.attributes.position.array.slice();
+   const attr=geom.attributes.position;spherePositions=new Float32Array(basePositions.length);
+   for(let i=0;i<attr.count;i++){
+    const x=basePositions[i*3],y=basePositions[i*3+1],z=basePositions[i*3+2];
+    const len=Math.max(.00001,Math.hypot(x,y,z));
+    spherePositions[i*3]=x/len*.42;spherePositions[i*3+1]=y/len*.42;spherePositions[i*3+2]=z/len*.42;
+   }
+   if(o.material){
+    o.material=o.material.clone();
+    if('color'in o.material)o.material.color.set(0xe1b9ff);
+    if('roughness'in o.material)o.material.roughness=.19;
+    if('metalness'in o.material)o.material.metalness=.22;
+    if('emissive'in o.material){o.material.emissive=new THREE.Color(0x6b2d77);o.material.emissiveIntensity=.72;}
+    if('clearcoat'in o.material)o.material.clearcoat=.8;
+   }
+  }
+ });
+ if(!mesh)hint.textContent='В torus.glb не найден объект-меш.';
+},undefined,err=>{console.error(err);hint.textContent='Не найден torus.glb. Положи его рядом с HTML-файлом.';});
+
+function createBurst(){
+ if(!mesh||burst)return;
+ const a=geom.attributes.position,count=Math.min(360,a.count),arr=new Float32Array(count*3);particleVelocities=[];
+ mesh.updateWorldMatrix(true,false);
+ for(let i=0;i<count;i++){
+  const idx=Math.floor(Math.random()*a.count),v=new THREE.Vector3(a.getX(idx),a.getY(idx),a.getZ(idx));mesh.localToWorld(v);
+  arr.set([v.x,v.y,v.z],i*3);
+  particleVelocities.push(new THREE.Vector3(Math.random()-.5,Math.random()-.1,Math.random()-.5).normalize().multiplyScalar(.55+Math.random()*2.1));
+ }
+ const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(arr,3));
+ const m=new THREE.PointsMaterial({color:0xd8f2a0,size:.019,transparent:true,opacity:.95,depthWrite:false,blending:THREE.AdditiveBlending});
+ particles=new THREE.Points(g,m);scene.add(particles);mesh.visible=false;burst=true;burstAge=0;
+}
+function updateBurst(dt){
+ if(!burst||!particles)return;
+ burstAge+=dt;const a=particles.geometry.attributes.position;
+ for(let i=0;i<a.count;i++){const v=particleVelocities[i];a.setXYZ(i,a.getX(i)+v.x*dt,a.getY(i)+v.y*dt,a.getZ(i)+v.z*dt);v.y-=.25*dt;}
+ a.needsUpdate=true;particles.material.opacity=Math.max(0,1-burstAge/1.8);
+ if(burstAge>3.1){scene.remove(particles);particles.geometry.dispose();particles.material.dispose();particles=null;particleVelocities=[];burst=false;if(mesh)mesh.visible=true;}
+}
+
+function updateShape(dt,t){
+ if(!mesh||!geom||!basePositions||!spherePositions||burst)return;
+ morph+=(morphTarget-morph)*Math.min(1,dt*1.35);
+ const a=geom.attributes.position;
+ // Blend toward a sphere first, then add rubbery stretch/shear driven by tilt.
+ const stretchX=1+Math.min(1.7,Math.abs(tiltZ)*1.7);
+ const stretchY=1+Math.min(1.8,Math.abs(tiltX)*1.8);
+ const shearX=tiltZ*1.15, shearZ=tiltX*1.0;
+ const wobble=.025*Math.sin(t*2.2);
+ for(let i=0;i<a.count;i++){
+  const k=i*3;
+  let x=basePositions[k]*(1-morph)+spherePositions[k]*morph;
+  let y=basePositions[k+1]*(1-morph)+spherePositions[k+1]*morph;
+  let z=basePositions[k+2]*(1-morph)+spherePositions[k+2]*morph;
+  // Strong elastic "gum" pull: stretch, shear, and a traveling ripple.
+  const wave=Math.sin(y*8-t*3.0+x*4)*wobble;
+  const nx=x*stretchX+shearX*y+wave;
+  const ny=y*stretchY+Math.sin(x*5+t*2)*Math.abs(tiltZ)*.10;
+  const nz=z*(1+Math.min(1.4,Math.abs(tiltX)*1.45))+shearZ*x+wave*.6;
+  a.array[k]=nx;a.array[k+1]=ny;a.array[k+2]=nz;
+ }
+ a.needsUpdate=true;geom.computeVertexNormals();
+ if(mesh.material&&'roughness'in mesh.material)mesh.material.roughness=.16+.25*morph;
+ if(mesh.material&&'emissiveIntensity'in mesh.material)mesh.material.emissiveIntensity=.58+.25*(.5+.5*Math.sin(t*1.7));
+}
+
+function orientationHandler(e){
+ if(!gyroEnabled||e.beta==null||e.gamma==null)return;
+ const d=Math.PI/180;
+ // Centre the sensor around neutral so normal phone orientation doesn't permanently stretch it.
+ tiltX=THREE.MathUtils.clamp((e.beta-35)*d,-1.1,1.1);
+ tiltZ=THREE.MathUtils.clamp(e.gamma*d,-1.1,1.1);
+}
+function motionHandler(e){
+ if(!gyroEnabled)return;
+ const a=e.acceleration;if(!a||a.x==null)return;
+ const magnitude=Math.hypot(a.x,a.y,a.z),now=performance.now();
+ if(magnitude>12.5&&now-lastShake>2200){createBurst();lastShake=now;}
+}
+async function enterImmersive(){
+ try{
+  if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function')
+   gyroEnabled=(await DeviceOrientationEvent.requestPermission())==='granted';
+  else gyroEnabled=typeof DeviceOrientationEvent!=='undefined';
+  if(gyroEnabled){
+   window.addEventListener('deviceorientation',orientationHandler,true);
+   if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function'){
+    try{if((await DeviceMotionEvent.requestPermission())==='granted')window.addEventListener('devicemotion',motionHandler,true);}catch{}
+   }else window.addEventListener('devicemotion',motionHandler,true);
+  }
+  if(navigator.xr&&await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)){
+   const session=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']});
+   await renderer.xr.setSession(session);document.querySelector('#enter').hidden=true;
+   session.addEventListener('end',()=>document.querySelector('#enter').hidden=false);
+  }else{
+   try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen();}catch{}
+   hint.textContent='';
+  }
+ }catch(err){console.warn(err);hint.textContent='Разреши датчики движения в браузере и попробуй снова.';}
+}
+document.querySelector('#enter').addEventListener('click',enterImmersive);
+
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'){dragging=true;lastX=e.clientX;lastY=e.clientY;renderer.domElement.setPointerCapture(e.pointerId);}});
+renderer.domElement.addEventListener('pointermove',e=>{
+ if(!dragging||e.pointerType!=='mouse'||gyroEnabled||renderer.xr.isPresenting)return;
+ yaw-=(e.clientX-lastX)*.003;pitch=THREE.MathUtils.clamp(pitch-(e.clientY-lastY)*.003,-1.35,1.35);
+ camera.rotation.set(pitch,yaw,0,'YXZ');lastX=e.clientX;lastY=e.clientY;
+});
+renderer.domElement.addEventListener('pointerup',()=>dragging=false);renderer.domElement.addEventListener('pointercancel',()=>dragging=false);
+window.addEventListener('keydown',e=>keys.add(e.code));window.addEventListener('keyup',e=>keys.delete(e.code));
+
+function animate(t,dt){
+ // Gentle, slowly orbiting light sources; color and intensity drift instead of flashing.
+ lights.forEach((l,i)=>{
+  const phase=t*.31+i*1.75;
+  l.intensity=[22,18,12,10][i]*(.78+.22*Math.sin(phase));
+  l.position.x=[1.1,-1.6,0,1.8][i]+Math.sin(t*.17+i*2.1)*.42;
+  l.position.y=[2.2,1.4,2.8,.55][i]+Math.sin(t*.23+i)*.18;
+ });
+ floorGlow1.material.opacity=.085+.045*(.5+.5*Math.sin(t*.7));
+ floorGlow2.material.opacity=.035+.035*(.5+.5*Math.sin(t*.9+1.8));
+
+ // Seamless 12-second pendulum loop: smooth rise, drift, return, with a different curved path each half.
+ // Cosine easing has zero velocity at both ends, avoiding a visible snap at the loop boundary.
+ if(!burst){
+  const phase=(t%12)/12;
+  const pendulum=.5-.5*Math.cos(phase*Math.PI*2);
+  const pathX=Math.sin(phase*Math.PI*2)*.22 + Math.sin(phase*Math.PI*4)*.055;
+  const pathZ=-2+Math.sin(phase*Math.PI*2+0.8)*.12;
+  anchor.position.set(pathX,.15+pendulum*1.08+Math.sin(t*1.15)*.025,pathZ);
+  anchor.rotation.y=Math.sin(phase*Math.PI*2)*.32+t*.06;
+  anchor.rotation.x=tiltX*.12;
+  anchor.rotation.z=tiltZ*.12;
+ }
+ if(mesh&&!burst){
+  const activeCam=renderer.xr.isPresenting?renderer.xr.getCamera(camera):camera;
+  const cp=new THREE.Vector3();activeCam.getWorldPosition(cp);
+  const op=new THREE.Vector3();anchor.getWorldPosition(op);
+  const distance=cp.distanceTo(op);
+  morphTarget=THREE.MathUtils.clamp((1.8-distance)/1.05,0,1);
+  mesh.rotation.x+=(tiltX*.5-mesh.rotation.x)*Math.min(1,dt*1.7);
+  mesh.rotation.z+=(tiltZ*.5-mesh.rotation.z)*Math.min(1,dt*1.7);
+ }
+ updateShape(dt,t);updateBurst(dt);
+ if(!renderer.xr.isPresenting&&!gyroEnabled){
+  const speed=1.1*dt,forward=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw)),right=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));
+  if(keys.has('KeyW')||keys.has('ArrowUp'))camera.position.addScaledVector(forward,speed);
+  if(keys.has('KeyS')||keys.has('ArrowDown'))camera.position.addScaledVector(forward,-speed);
+  if(keys.has('KeyA')||keys.has('ArrowLeft'))camera.position.addScaledVector(right,-speed);
+  if(keys.has('KeyD')||keys.has('ArrowRight'))camera.position.addScaledVector(right,speed);
+  camera.position.y=1.62;
+ }else if(gyroEnabled&&!renderer.xr.isPresenting){
+  camera.rotation.set(THREE.MathUtils.clamp(tiltX,-1.15,1.15),yaw,THREE.MathUtils.clamp(tiltZ,-1.15,1.15),'YXZ');
+ }
+ renderer.render(scene,camera);
+}
+renderer.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.05);animate(clock.elapsedTime,dt);});
+window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+</script>
+</body>
+</html>

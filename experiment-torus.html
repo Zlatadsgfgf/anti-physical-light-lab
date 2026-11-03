@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#020203">
+<title>Experiment — Interactive Torus</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#020203}
+body{position:fixed;inset:0;overscroll-behavior:none;touch-action:none}
+canvas{display:block;width:100%;height:100%;outline:none}
+#enter{position:fixed;z-index:5;right:16px;bottom:16px;width:42px;height:42px;border:1px solid #ffffff35;border-radius:50%;background:#10101455;color:#ffffffb0;display:grid;place-items:center;padding:0;cursor:pointer;backdrop-filter:blur(8px)}
+#enter svg{width:19px;height:19px}
+#status{position:fixed;left:12px;bottom:12px;color:#ffffff45;font:11px system-ui,sans-serif;pointer-events:none}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+</head>
+<body>
+<button id="enter" aria-label="Войти в иммерсивный режим"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+<div id="status"></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x020203);
+scene.fog = new THREE.FogExp2(0x020203, 0.025);
+
+const camera = new THREE.PerspectiveCamera(72, innerWidth/innerHeight, 0.03, 100);
+camera.position.set(0, 1.62, 0);
+camera.rotation.order = 'YXZ';
+
+const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0x263548, 0x030305, 0.7));
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(200,200), new THREE.MeshStandardMaterial({color:0x050507, roughness:.98}));
+floor.rotation.x = -Math.PI/2; floor.position.y = -.015; scene.add(floor);
+
+function area(color, intensity, pos, size=2) {
+  const l = new THREE.PointLight(color, intensity, 9, 1.7);
+  l.position.set(...pos); scene.add(l); return l;
+}
+const lights = [
+  area(0x26d8e8, 17, [1.5,2.0,-1.5]),
+  area(0x654cff, 14, [-1.5,1.4,-2.4]),
+  area(0xff356e, 8, [0,2.8,-3.2])
+];
+
+const status = document.querySelector('#status');
+const loader = new GLTFLoader();
+let objectRoot = new THREE.Group();
+objectRoot.position.set(0,0,-2);
+scene.add(objectRoot);
+
+let interactiveMesh = null;
+let mixer = null;
+let idleAction = null;
+let morphStartPositions = null;
+let sphereTargets = null;
+let currentMorph = 0;
+let desiredMorph = 0;
+let particleCloud = null;
+let particleVelocities = [];
+let burstActive = false;
+let burstTimer = 0;
+let returnTimer = 0;
+let gyroEnabled = false;
+let drag = false, lastX=0, lastY=0, yaw=0, pitch=0;
+let keys = new Set();
+let shakeCooldown = 0;
+let previousAcceleration = null;
+let tiltX = 0, tiltZ = 0;
+const clock = new THREE.Clock();
+
+loader.load('./torus.glb', (gltf) => {
+  // The GLB should contain only the INTERACTIVE_Torus object.
+  const loaded = gltf.scene;
+  objectRoot.add(loaded);
+  loaded.position.set(0,0,0);
+  loaded.traverse(o => {
+    if (o.isMesh && !interactiveMesh) {
+      interactiveMesh = o;
+      if (o.geometry && o.geometry.attributes.position) {
+        const p = o.geometry.attributes.position;
+        morphStartPositions = p.array.slice();
+        sphereTargets = new Float32Array(p.array.length);
+        // Approximate a spherical shell from each vertex direction.
+        for (let i=0; i<p.count; i++) {
+          const x=p.getX(i), y=p.getY(i), z=p.getZ(i);
+          const len=Math.max(0.0001, Math.hypot(x,y,z));
+          const r=0.48;
+          sphereTargets[i*3]=(x/len)*r;
+          sphereTargets[i*3+1]=(y/len)*r;
+          sphereTargets[i*3+2]=(z/len)*r;
+        }
+        o.geometry = o.geometry.clone();
+      }
+      if (o.material) {
+        o.material = o.material.clone();
+        if ('roughness' in o.material) o.material.roughness = .28;
+        if ('metalness' in o.material) o.material.metalness = .38;
+      }
+    }
+  });
+  if (gltf.animations.length) {
+    mixer = new THREE.AnimationMixer(loaded);
+    idleAction = mixer.clipAction(gltf.animations[0]);
+    idleAction.setLoop(THREE.LoopRepeat, Infinity);
+    idleAction.play();
+  }
+  status.textContent = '';
+}, undefined, (err) => {
+  console.error(err);
+  status.textContent = 'Не найден torus.glb — положи GLB рядом с этим HTML-файлом';
+});
+
+function makeParticles() {
+  if (!interactiveMesh || particleCloud) return;
+  const src = interactiveMesh.geometry.attributes.position;
+  const count = Math.min(260, src.count);
+  const arr = new Float32Array(count*3);
+  particleVelocities = [];
+  for (let i=0; i<count; i++) {
+    const idx = Math.floor(Math.random()*src.count);
+    arr[i*3]=src.getX(idx); arr[i*3+1]=src.getY(idx); arr[i*3+2]=src.getZ(idx);
+    const v = new THREE.Vector3(Math.random()-.5, Math.random()-.15, Math.random()-.5).normalize().multiplyScalar(.7+Math.random()*1.8);
+    particleVelocities.push(v);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(arr,3));
+  const mat = new THREE.PointsMaterial({color:0x69e8f4, size:.018, transparent:true, opacity:.95, depthWrite:false});
+  particleCloud = new THREE.Points(geo,mat);
+  interactiveMesh.getWorldPosition(particleCloud.position);
+  scene.add(particleCloud);
+}
+function burst() {
+  if (!interactiveMesh || burstActive) return;
+  makeParticles();
+  if (!particleCloud) return;
+  burstActive = true; burstTimer = 1.5; returnTimer = 4.0;
+  interactiveMesh.visible = false;
+  if (mixer) mixer.timeScale = 0;
+}
+function restoreAfterBurst(dt) {
+  if (!burstActive || !particleCloud) return;
+  burstTimer -= dt;
+  const a = particleCloud.geometry.attributes.position;
+  for(let i=0;i<a.count;i++){
+    a.setXYZ(i, a.getX(i)+particleVelocities[i].x*dt, a.getY(i)+particleVelocities[i].y*dt, a.getZ(i)+particleVelocities[i].z*dt);
+  }
+  a.needsUpdate = true;
+  particleCloud.material.opacity = Math.max(0, burstTimer/1.5);
+  returnTimer -= dt;
+  if(returnTimer<=0){
+    scene.remove(particleCloud); particleCloud.geometry.dispose(); particleCloud.material.dispose();
+    particleCloud=null; particleVelocities=[]; burstActive=false;
+    if(interactiveMesh) interactiveMesh.visible=true;
+    if(mixer) mixer.timeScale=1;
+  }
+}
+
+function updateMorph(dt) {
+  if(!interactiveMesh || !morphStartPositions || !sphereTargets || burstActive) return;
+  currentMorph += (desiredMorph-currentMorph)*Math.min(1,dt*1.8);
+  const p=interactiveMesh.geometry.attributes.position;
+  for(let i=0;i<p.count;i++){
+    const k=i*3;
+    p.array[k]=morphStartPositions[k]*(1-currentMorph)+sphereTargets[k]*currentMorph;
+    p.array[k+1]=morphStartPositions[k+1]*(1-currentMorph)+sphereTargets[k+1]*currentMorph;
+    p.array[k+2]=morphStartPositions[k+2]*(1-currentMorph)+sphereTargets[k+2]*currentMorph;
+  }
+  p.needsUpdate=true;
+  interactiveMesh.geometry.computeVertexNormals();
+  if(interactiveMesh.material && 'roughness' in interactiveMesh.material) interactiveMesh.material.roughness=.28+.55*currentMorph;
+}
+
+function onOrientation(e) {
+  if(!gyroEnabled || e.beta==null || e.gamma==null) return;
+  const d=Math.PI/180;
+  tiltX=THREE.MathUtils.clamp(e.beta*d,-1,1);
+  tiltZ=THREE.MathUtils.clamp(e.gamma*d,-1,1);
+  // Tilt gently distorts the object's scale/rotation; not a literal Blender Screw modifier.
+}
+function onMotion(e) {
+  if(!gyroEnabled) return;
+  const a=e.accelerationIncludingGravity;
+  if(!a || a.x==null) return;
+  const now = performance.now();
+  const mag=Math.hypot(a.x,a.y,a.z);
+  if(previousAcceleration!==null && Math.abs(mag-previousAcceleration)>13 && now>shakeCooldown){
+    burst(); shakeCooldown=now+1800;
+  }
+  previousAcceleration=mag;
+}
+
+async function enterView(){
+  try {
+    if(!document.fullscreenElement) await document.documentElement.requestFullscreen?.().catch(()=>{});
+    if(typeof DeviceOrientationEvent!=='undefined'){
+      if(typeof DeviceOrientationEvent.requestPermission==='function'){
+        gyroEnabled=(await DeviceOrientationEvent.requestPermission())==='granted';
+      } else gyroEnabled=true;
+      if(gyroEnabled){
+        window.addEventListener('deviceorientation',onOrientation,true);
+        if('DeviceMotionEvent' in window && typeof DeviceMotionEvent.requestPermission==='function'){
+          try { const r=await DeviceMotionEvent.requestPermission(); if(r==='granted') window.addEventListener('devicemotion',onMotion,true); } catch {}
+        } else window.addEventListener('devicemotion',onMotion,true);
+      }
+    }
+    if(navigator.xr && await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)){
+      const session=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']});
+      await renderer.xr.setSession(session);
+      document.querySelector('#enter').hidden=true;
+      session.addEventListener('end',()=>document.querySelector('#enter').hidden=false);
+    }
+  } catch(e) { console.warn(e); }
+}
+document.querySelector('#enter').addEventListener('click',enterView);
+
+renderer.domElement.addEventListener('pointerdown',e=>{
+  if(e.pointerType==='mouse'){drag=true;lastX=e.clientX;lastY=e.clientY;renderer.domElement.setPointerCapture(e.pointerId)}
+});
+renderer.domElement.addEventListener('pointermove',e=>{
+  if(!drag || e.pointerType!=='mouse' || gyroEnabled || renderer.xr.isPresenting) return;
+  yaw-=(e.clientX-lastX)*.003; pitch=THREE.MathUtils.clamp(pitch-(e.clientY-lastY)*.003,-1.45,1.45);
+  camera.rotation.set(pitch,yaw,0,'YXZ'); lastX=e.clientX;lastY=e.clientY;
+});
+renderer.domElement.addEventListener('pointerup',()=>drag=false);
+renderer.domElement.addEventListener('pointercancel',()=>drag=false);
+window.addEventListener('keydown',e=>keys.add(e.code));
+window.addEventListener('keyup',e=>keys.delete(e.code));
+
+function animate(t,dt){
+  lights.forEach((l,i)=>{
+    l.intensity=(i===0?17:i===1?14:8)*(.68+.32*Math.sin(t*.6+i*2));
+    l.position.x=Math.sin(t*.24+i*2)*1.4;
+  });
+
+  if(interactiveMesh && !burstActive){
+    // A virtual proximity signal: works with camera position in tracked VR.
+    const activeCamera = renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera;
+    const camWorld=new THREE.Vector3(); activeCamera.getWorldPosition(camWorld);
+    const objWorld=new THREE.Vector3(); interactiveMesh.getWorldPosition(objWorld);
+    const distance=camWorld.distanceTo(objWorld);
+    desiredMorph=THREE.MathUtils.clamp((2.1-distance)/1.25,0,1);
+
+    // In VR, derive a simple tilt signal from tracked head orientation.
+    if(renderer.xr.isPresenting){
+      const euler = new THREE.Euler().setFromQuaternion(activeCamera.quaternion, 'YXZ');
+      tiltX = THREE.MathUtils.clamp(euler.x, -1, 1);
+      tiltZ = THREE.MathUtils.clamp(euler.z, -1, 1);
+    }
+    interactiveMesh.rotation.x += (tiltX*.7-interactiveMesh.rotation.x)*Math.min(1,dt*2.5);
+    interactiveMesh.rotation.z += (tiltZ*.7-interactiveMesh.rotation.z)*Math.min(1,dt*2.5);
+    interactiveMesh.scale.x=1+Math.sin(t*.55)*.018+Math.abs(tiltZ)*.18;
+    interactiveMesh.scale.z=1+Math.cos(t*.4)*.018+Math.abs(tiltX)*.18;
+  }
+  updateMorph(dt);
+  restoreAfterBurst(dt);
+
+  if(!renderer.xr.isPresenting && !gyroEnabled){
+    const speed=1.2*dt;
+    const forward=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw));
+    const right=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));
+    if(keys.has('KeyW')||keys.has('ArrowUp')) camera.position.addScaledVector(forward,speed);
+    if(keys.has('KeyS')||keys.has('ArrowDown')) camera.position.addScaledVector(forward,-speed);
+    if(keys.has('KeyA')||keys.has('ArrowLeft')) camera.position.addScaledVector(right,-speed);
+    if(keys.has('KeyD')||keys.has('ArrowRight')) camera.position.addScaledVector(right,speed);
+    camera.position.y=1.62;
+  }
+  renderer.render(scene,camera);
+}
+window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+renderer.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.05);if(mixer)mixer.update(dt);animate(clock.elapsedTime,dt)});
+</script>
+</body>
+</html>

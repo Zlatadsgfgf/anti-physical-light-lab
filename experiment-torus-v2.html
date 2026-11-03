@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#020203">
+<title>Experiment — Interactive Torus v2</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#020203}
+body{position:fixed;inset:0;overscroll-behavior:none;touch-action:none}
+canvas{display:block;width:100%;height:100%;outline:none}
+#enter{position:fixed;z-index:5;right:16px;bottom:16px;width:44px;height:44px;border:1px solid #ffffff40;border-radius:50%;background:#10101480;color:#ffffffcc;display:grid;place-items:center;padding:0;cursor:pointer;backdrop-filter:blur(8px)}
+#enter svg{width:19px;height:19px}
+#hint{position:fixed;left:12px;bottom:12px;color:#ffffff65;font:11px system-ui,sans-serif;pointer-events:none;max-width:75vw}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+</head>
+<body>
+<button id="enter" aria-label="Войти в иммерсивный режим"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+<div id="hint"></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const hint=document.querySelector('#hint');
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x020203);
+scene.fog=new THREE.FogExp2(0x020203,.025);
+
+const camera=new THREE.PerspectiveCamera(72,innerWidth/innerHeight,.03,100);
+camera.position.set(0,1.62,0);
+camera.rotation.order='YXZ';
+
+const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
+renderer.setSize(innerWidth,innerHeight);
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.1;
+renderer.xr.enabled=true;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0x263548,0x030305,.75));
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(200,200),new THREE.MeshStandardMaterial({color:0x050507,roughness:.98}));
+floor.rotation.x=-Math.PI/2;floor.position.y=0;scene.add(floor);
+
+function pointLight(color,intensity,pos){
+ const l=new THREE.PointLight(color,intensity,9,1.7);l.position.set(...pos);scene.add(l);return l;
+}
+const lights=[pointLight(0x26d8e8,17,[1.5,2,-1.5]),pointLight(0x654cff,14,[-1.5,1.4,-2.4]),pointLight(0xff356e,8,[0,2.8,-3.2])];
+
+// Fixed object anchor: two metres in front of the viewer, above the virtual floor.
+const objectAnchor=new THREE.Group();
+objectAnchor.position.set(0,0.15,-2.0);
+scene.add(objectAnchor);
+const modelRoot=new THREE.Group();
+objectAnchor.add(modelRoot);
+
+let mesh=null, geom=null, originalPositions=null, spherePositions=null, morph=0, morphTarget=0;
+let particles=null, particleVelocities=[], burst=false, burstAge=0, respawnAge=0;
+let modelLoaded=false, gyroEnabled=false, tiltX=0, tiltZ=0, yaw=0, pitch=0;
+let dragging=false,lastX=0,lastY=0;
+const keys=new Set();
+let previousAccel=null,lastShake=0;
+const clock=new THREE.Clock();
+const loader=new GLTFLoader();
+
+// The GLB is expected in the SAME folder as this HTML file, named exactly torus.glb.
+loader.load('./torus.glb', gltf=>{
+ const loaded=gltf.scene;
+ modelRoot.add(loaded);
+ // Center and normalize the exported model so Blender object transforms don't hide it.
+ loaded.updateMatrixWorld(true);
+ const box=new THREE.Box3().setFromObject(loaded);
+ const size=new THREE.Vector3();box.getSize(size);
+ const center=new THREE.Vector3();box.getCenter(center);
+ if(size.length()>0){
+   loaded.position.sub(center);
+   loaded.scale.setScalar(0.9/Math.max(size.x,size.y,size.z));
+ }
+ loaded.updateMatrixWorld(true);
+ loaded.traverse(o=>{
+   if(o.isMesh && !mesh){
+     mesh=o;geom=o.geometry.clone();o.geometry=geom;
+     originalPositions=geom.attributes.position.array.slice();
+     const attr=geom.attributes.position;
+     spherePositions=new Float32Array(attr.array.length);
+     for(let i=0;i<attr.count;i++){
+       const x=originalPositions[i*3],y=originalPositions[i*3+1],z=originalPositions[i*3+2];
+       const len=Math.max(.00001,Math.hypot(x,y,z));
+       spherePositions[i*3]=x/len*.42;
+       spherePositions[i*3+1]=y/len*.42;
+       spherePositions[i*3+2]=z/len*.42;
+     }
+     if(o.material){
+       o.material=o.material.clone();
+       if('roughness' in o.material)o.material.roughness=.28;
+       if('metalness' in o.material)o.material.metalness=.38;
+       if('emissive' in o.material){o.material.emissive=new THREE.Color(0x06343a);o.material.emissiveIntensity=.35;}
+     }
+   }
+ });
+ modelLoaded=!!mesh;
+ if(!modelLoaded)hint.textContent='В torus.glb не найден меш. Проверь экспорт модели.';
+},undefined,err=>{
+ console.error(err);
+ hint.textContent='Не найден torus.glb. Загрузите его рядом с этим HTML-файлом.';
+});
+
+function createBurst(){
+ if(!mesh||burst)return;
+ const attr=geom.attributes.position;
+ const count=Math.min(320,attr.count);
+ const arr=new Float32Array(count*3);particleVelocities=[];
+ mesh.updateWorldMatrix(true,false);
+ for(let i=0;i<count;i++){
+   const idx=Math.floor(Math.random()*attr.count);
+   const v=new THREE.Vector3(attr.getX(idx),attr.getY(idx),attr.getZ(idx));
+   mesh.localToWorld(v);
+   arr[i*3]=v.x;arr[i*3+1]=v.y;arr[i*3+2]=v.z;
+   const vel=new THREE.Vector3(Math.random()-.5,Math.random()-.15,Math.random()-.5).normalize().multiplyScalar(.45+Math.random()*1.8);
+   particleVelocities.push(vel);
+ }
+ const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(arr,3));
+ const m=new THREE.PointsMaterial({color:0x69e8f4,size:.018,transparent:true,opacity:.95,depthWrite:false});
+ particles=new THREE.Points(g,m);scene.add(particles);
+ mesh.visible=false;burst=true;burstAge=0;respawnAge=0;
+}
+function updateBurst(dt){
+ if(!burst||!particles)return;
+ burstAge+=dt;respawnAge+=dt;
+ const a=particles.geometry.attributes.position;
+ for(let i=0;i<a.count;i++){
+   const v=particleVelocities[i];
+   a.setXYZ(i,a.getX(i)+v.x*dt,a.getY(i)+v.y*dt,a.getZ(i)+v.z*dt);
+   v.y-=.35*dt;
+ }
+ a.needsUpdate=true;
+ particles.material.opacity=Math.max(0,1-burstAge/1.7);
+ if(respawnAge>3.2){
+   scene.remove(particles);particles.geometry.dispose();particles.material.dispose();particles=null;
+   particleVelocities=[];burst=false;
+   if(mesh)mesh.visible=true;
+   // Restart the rise cycle without abruptly teleporting the object.
+   objectAnchor.position.y=-.15;
+ }
+}
+function updateMorph(dt){
+ if(!mesh||!geom||!originalPositions||!spherePositions||burst)return;
+ morph+=(morphTarget-morph)*Math.min(1,dt*1.6);
+ const a=geom.attributes.position;
+ for(let i=0;i<a.count;i++){
+   const k=i*3;
+   a.array[k]=originalPositions[k]*(1-morph)+spherePositions[k]*morph;
+   a.array[k+1]=originalPositions[k+1]*(1-morph)+spherePositions[k+1]*morph;
+   a.array[k+2]=originalPositions[k+2]*(1-morph)+spherePositions[k+2]*morph;
+ }
+ a.needsUpdate=true;geom.computeVertexNormals();
+ if(mesh.material&&'roughness'in mesh.material)mesh.material.roughness=.25+.55*morph;
+}
+
+function orientationHandler(e){
+ if(!gyroEnabled||e.beta==null||e.gamma==null)return;
+ const d=Math.PI/180;
+ tiltX=THREE.MathUtils.clamp(e.beta*d,-.8,.8);
+ tiltZ=THREE.MathUtils.clamp(e.gamma*d,-.8,.8);
+}
+function motionHandler(e){
+ if(!gyroEnabled)return;
+ const a=e.acceleration;
+ if(!a||a.x==null)return;
+ const mag=Math.hypot(a.x,a.y,a.z);
+ const now=performance.now();
+ if(mag>16&&now-lastShake>2200){createBurst();lastShake=now;}
+ previousAccel=mag;
+}
+async function enterImmersive(){
+ const btn=document.querySelector('#enter');
+ try{
+   // Request permissions from this user gesture on iOS where required.
+   if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function'){
+     gyroEnabled=(await DeviceOrientationEvent.requestPermission())==='granted';
+   }else gyroEnabled=typeof DeviceOrientationEvent!=='undefined';
+   if(gyroEnabled){
+     window.addEventListener('deviceorientation',orientationHandler,true);
+     if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function'){
+       try{const p=await DeviceMotionEvent.requestPermission();if(p==='granted')window.addEventListener('devicemotion',motionHandler,true);}catch{}
+     }else window.addEventListener('devicemotion',motionHandler,true);
+   }
+   if(navigator.xr&&await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false)){
+     const session=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']});
+     await renderer.xr.setSession(session);
+     btn.hidden=true;
+     session.addEventListener('end',()=>{btn.hidden=false;});
+   }else{
+     try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen();}
+     catch{}
+     // In phone fullscreen, keep a fixed forward view and let device orientation steer the camera.
+     hint.textContent='';
+   }
+ }catch(err){console.warn(err);hint.textContent='Устройство не разрешило иммерсивный режим или датчики.';}
+}
+document.querySelector('#enter').addEventListener('click',enterImmersive);
+
+// Desktop fallback: drag to look around, WASD to move. Touch is not used as a drag interface.
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'){dragging=true;lastX=e.clientX;lastY=e.clientY;renderer.domElement.setPointerCapture(e.pointerId);}});
+renderer.domElement.addEventListener('pointermove',e=>{
+ if(!dragging||e.pointerType!=='mouse'||gyroEnabled||renderer.xr.isPresenting)return;
+ yaw-=(e.clientX-lastX)*.003;pitch=THREE.MathUtils.clamp(pitch-(e.clientY-lastY)*.003,-1.35,1.35);
+ camera.rotation.set(pitch,yaw,0,'YXZ');lastX=e.clientX;lastY=e.clientY;
+});
+renderer.domElement.addEventListener('pointerup',()=>dragging=false);
+renderer.domElement.addEventListener('pointercancel',()=>dragging=false);
+window.addEventListener('keydown',e=>keys.add(e.code));window.addEventListener('keyup',e=>keys.delete(e.code));
+
+function frame(t,dt){
+ // Slow, continuous light evolution.
+ lights.forEach((l,i)=>{l.intensity=(i===0?17:i===1?14:8)*(.78+.22*Math.sin(t*.45+i*2));l.position.x=Math.sin(t*.2+i*2)*1.3;});
+
+ // Smooth rising cycle: rise over 2.8s, then hover and breathe; repeat slowly.
+ if(!burst){
+   const cycle=(t%10)/10;
+   let rise;
+   if(cycle<.28){const q=cycle/.28;rise=q*q*(3-2*q);}
+   else rise=1;
+   objectAnchor.position.y=-.2+rise*1.25 + Math.sin(t*1.1)*.025;
+   objectAnchor.rotation.y=t*.28;
+   objectAnchor.rotation.x=tiltX*.16;
+   objectAnchor.rotation.z=tiltZ*.16;
+ }
+ if(mesh&&!burst){
+   const activeCam=renderer.xr.isPresenting?renderer.xr.getCamera(camera):camera;
+   const cp=new THREE.Vector3();activeCam.getWorldPosition(cp);
+   const op=new THREE.Vector3();objectAnchor.getWorldPosition(op);
+   const distance=cp.distanceTo(op);
+   morphTarget=THREE.MathUtils.clamp((1.75-distance)/1.0,0,1);
+   // Tilt deformation, with smoothing; shape deformation is in addition to rotation.
+   mesh.rotation.x+=(tiltX*.6-mesh.rotation.x)*Math.min(1,dt*2.2);
+   mesh.rotation.z+=(tiltZ*.6-mesh.rotation.z)*Math.min(1,dt*2.2);
+   mesh.scale.x=1+Math.abs(tiltZ)*.18+Math.sin(t*.6)*.012;
+   mesh.scale.z=1+Math.abs(tiltX)*.18+Math.cos(t*.5)*.012;
+ }
+ updateMorph(dt);updateBurst(dt);
+
+ if(!renderer.xr.isPresenting&&!gyroEnabled){
+   const speed=1.1*dt;
+   const forward=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw));
+   const right=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));
+   if(keys.has('KeyW')||keys.has('ArrowUp'))camera.position.addScaledVector(forward,speed);
+   if(keys.has('KeyS')||keys.has('ArrowDown'))camera.position.addScaledVector(forward,-speed);
+   if(keys.has('KeyA')||keys.has('ArrowLeft'))camera.position.addScaledVector(right,-speed);
+   if(keys.has('KeyD')||keys.has('ArrowRight'))camera.position.addScaledVector(right,speed);
+   camera.position.y=1.62;
+ }else if(gyroEnabled&&!renderer.xr.isPresenting){
+   // Phone orientation controls view direction in fullscreen mode.
+   camera.rotation.set(THREE.MathUtils.clamp(tiltX,-1.2,1.2),yaw,THREE.MathUtils.clamp(tiltZ,-1.2,1.2),'YXZ');
+ }
+ renderer.render(scene,camera);
+}
+renderer.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.05);frame(clock.elapsedTime,dt);});
+window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+</script>
+</body>
+</html>
